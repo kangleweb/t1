@@ -1,4 +1,6 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2013 The Sifcoin developers
+// Copyright (c) 2013-2014 The Quarkcoin developers
 // Copyright (c) 2009-2014 The Bitcoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
@@ -27,7 +29,7 @@ using namespace std;
 using namespace boost;
 
 #if defined(NDEBUG)
-# error "Bitcoin cannot be compiled without assertions."
+# error "Quark cannot be compiled without assertions."
 #endif
 
 //
@@ -49,13 +51,6 @@ bool fBenchmark = false;
 bool fTxIndex = false;
 unsigned int nCoinCacheSize = 5000;
 
-/** Fees smaller than this (in satoshi) are considered zero fee (for transaction creation) */
-int64_t CTransaction::nMinTxFee = 10000;  // Override with -mintxfee
-/** Fees smaller than this (in satoshi) are considered zero fee (for relaying and mining) */
-int64_t CTransaction::nMinRelayTxFee = 1000;
-
-static CMedianFilter<int> cPeerBlockCounts(8, 0); // Amount of blocks that other nodes claim to have
-
 struct COrphanBlock {
     uint256 hashBlock;
     uint256 hashPrev;
@@ -64,13 +59,20 @@ struct COrphanBlock {
 map<uint256, COrphanBlock*> mapOrphanBlocks;
 multimap<uint256, COrphanBlock*> mapOrphanBlocksByPrev;
 
+std::map<uint256, CBlock*> mapOrphanBlocksSyncCheckpoint;
+
+/** Fees smaller than this (in satoshi) are considered zero fee (for transaction creation) */
+int64_t CTransaction::nMinTxFee = 10;  // Override with -mintxfee
+/** Fees smaller than this (in satoshi) are considered zero fee (for relaying and mining) */
+int64_t CTransaction::nMinRelayTxFee = 100;
+
 map<uint256, CTransaction> mapOrphanTransactions;
 map<uint256, set<uint256> > mapOrphanTransactionsByPrev;
 
 // Constant stuff for coinbase transactions we create:
 CScript COINBASE_FLAGS;
 
-const string strMessageMagic = "Bitcoin Signed Message:\n";
+const string strMessageMagic = "Quarkcoin Signed Message:\n";
 
 // Internal stuff
 namespace {
@@ -1180,24 +1182,34 @@ void static PruneOrphanBlocks()
     mapOrphanBlocks.erase(hash);
 }
 
+static const int64_t nGenesisBlockRewardCoin = 1 * COIN;
+static const int64_t nBlockRewardStartCoin = 2048 * COIN;
+static const int64_t nBlockRewardMinimumCoin = 1 * COIN;
+
+static const int64_t nTargetTimespan = 10 * 60; // 10 minutes
+static const int64_t nTargetSpacing = 30; // 30 seconds
+static const int64_t nInterval = nTargetTimespan / nTargetSpacing; // 20 blocks
+
 int64_t GetBlockValue(int nHeight, int64_t nFees)
 {
-    int64_t nSubsidy = 50 * COIN;
-    int halvings = nHeight / Params().SubsidyHalvingInterval();
+    if (nHeight == 0)
+    {
+        return nGenesisBlockRewardCoin;
+    }
+    
+    int64_t nSubsidy = nBlockRewardStartCoin;
 
-    // Force block reward to zero when right shift is undefined.
-    if (halvings >= 64)
-        return nFees;
-
-    // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
-    nSubsidy >>= halvings;
+    // Subsidy is cut in half every 60480 blocks (21 days)
+    nSubsidy >>= min((nHeight / 60480), 63);
+    
+    // Minimum subsidy
+    if (nSubsidy < nBlockRewardMinimumCoin)
+    {
+        nSubsidy = nBlockRewardMinimumCoin;
+    }
 
     return nSubsidy + nFees;
 }
-
-static const int64_t nTargetTimespan = 14 * 24 * 60 * 60; // two weeks
-static const int64_t nTargetSpacing = 10 * 60;
-static const int64_t nInterval = nTargetTimespan / nTargetSpacing;
 
 //
 // minimum amount of work that could possibly be required nTime after
@@ -1215,10 +1227,10 @@ unsigned int ComputeMinWork(unsigned int nBase, int64_t nTime)
     bnResult.SetCompact(nBase);
     while (nTime > 0 && bnResult < bnLimit)
     {
-        // Maximum 400% adjustment...
-        bnResult *= 4;
-        // ... in best-case exactly 4-times-normal target time
-        nTime -= nTargetTimespan*4;
+        // Maximum 200% adjustment...
+        bnResult *= 2;
+        // ... per timespan
+        nTime -= nTargetTimespan;
     }
     if (bnResult > bnLimit)
         bnResult = bnLimit;
@@ -1255,7 +1267,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
         return pindexLast->nBits;
     }
 
-    // Go back by what we want to be 14 days worth of blocks
+    // Go back by what we want to be nInterval blocks 
     const CBlockIndex* pindexFirst = pindexLast;
     for (int i = 0; pindexFirst && i < nInterval-1; i++)
         pindexFirst = pindexFirst->pprev;
@@ -1263,11 +1275,13 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
 
     // Limit adjustment step
     int64_t nActualTimespan = pindexLast->GetBlockTime() - pindexFirst->GetBlockTime();
-    LogPrintf("  nActualTimespan = %d  before bounds\n", nActualTimespan);
-    if (nActualTimespan < nTargetTimespan/4)
-        nActualTimespan = nTargetTimespan/4;
-    if (nActualTimespan > nTargetTimespan*4)
-        nActualTimespan = nTargetTimespan*4;
+    LogPrintf("  nActualTimespan = %d before bounds\n", nActualTimespan);
+    int64_t LimUp = nTargetTimespan * 100 / 110; // 110% up
+    int64_t LimDown = nTargetTimespan * 2; // 200% down
+    if (nActualTimespan < LimUp)
+        nActualTimespan = LimUp;
+    if (nActualTimespan > LimDown)
+        nActualTimespan = LimDown;
 
     // Retarget
     CBigNum bnNew;
@@ -1301,12 +1315,6 @@ bool CheckProofOfWork(uint256 hash, unsigned int nBits)
         return error("CheckProofOfWork() : hash doesn't match nBits");
 
     return true;
-}
-
-// Return maximum amount of blocks that other nodes claim to have
-int GetNumBlocksOfPeers()
-{
-    return std::max(cPeerBlockCounts.median(), Checkpoints::GetTotalBlocksEstimate());
 }
 
 bool IsInitialBlockDownload()
@@ -1987,7 +1995,7 @@ bool static DisconnectTip(CValidationState &state) {
 }
 
 // Connect a new block to chainActive.
-bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew) {
+bool ConnectTip(CValidationState &state, CBlockIndex *pindexNew) {
     assert(pindexNew->pprev == chainActive.Tip());
     mempool.check(pcoinsTip);
     // Read block from disk.
@@ -2031,6 +2039,16 @@ bool static ConnectTip(CValidationState &state, CBlockIndex *pindexNew) {
     BOOST_FOREACH(const CTransaction &tx, block.vtx) {
         SyncWithWallets(tx.GetHash(), tx, &block);
     }
+    
+    if (!Checkpoints::IsSyncCheckpointEnforced()) // checkpoint advisory mode
+    {
+        //if (pindexBest->pprev && !Checkpoints::CheckSyncCheckpoint(pindexBest->GetBlockHash(), pindexBest->pprev))
+        if (chainActive.Tip()->pprev && !Checkpoints::CheckSyncCheckpoint(chainActive.Tip()->GetBlockHash(), chainActive.Tip()->pprev))
+            Checkpoints::strCheckpointWarning = _("Warning: checkpoint on different blockchain fork, contact developers to resolve the issue");
+        else
+            Checkpoints::strCheckpointWarning = "";
+    }
+    
     return true;
 }
 
@@ -2394,21 +2412,26 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CDiskBlockPos* dbp)
             return state.DoS(100, error("AcceptBlock() : rejected by checkpoint lock-in at %d", nHeight),
                              REJECT_CHECKPOINT, "checkpoint mismatch");
 
+        // ppcoin: check that the block satisfies synchronized checkpoint
+        if (Checkpoints::IsSyncCheckpointEnforced() // checkpoint enforce mode
+           && !Checkpoints::CheckSyncCheckpoint(hash, pindexPrev))
+            return error("AcceptBlock() : rejected by synchronized checkpoint");
+            
         // Don't accept any forks from the main chain prior to last checkpoint
         CBlockIndex* pcheckpoint = Checkpoints::GetLastCheckpoint(mapBlockIndex);
         if (pcheckpoint && nHeight < pcheckpoint->nHeight)
             return state.DoS(100, error("AcceptBlock() : forked chain older than last checkpoint (height %d)", nHeight));
 
         // Reject block.nVersion=1 blocks when 95% (75% on testnet) of the network has upgraded:
-        if (block.nVersion < 2)
-        {
-            if ((!TestNet() && CBlockIndex::IsSuperMajority(2, pindexPrev, 950, 1000)) ||
-                (TestNet() && CBlockIndex::IsSuperMajority(2, pindexPrev, 75, 100)))
-            {
-                return state.Invalid(error("AcceptBlock() : rejected nVersion=1 block"),
-                                     REJECT_OBSOLETE, "bad-version");
-            }
-        }
+//        if (block.nVersion < 2)
+//        {
+//            if ((!TestNet() && CBlockIndex::IsSuperMajority(2, pindexPrev, 950, 1000)) ||
+//                (TestNet() && CBlockIndex::IsSuperMajority(2, pindexPrev, 75, 100)))
+//            {
+//                return state.Invalid(error("AcceptBlock() : rejected nVersion=1 block"),
+//                                     REJECT_OBSOLETE, "bad-version");
+//            }
+//        }
         // Enforce block.nVersion=2 rule that the coinbase starts with serialized block height
         if (block.nVersion >= 2)
         {
@@ -2452,6 +2475,9 @@ bool AcceptBlock(CBlock& block, CValidationState& state, CDiskBlockPos* dbp)
                 pnode->PushInventory(CInv(MSG_BLOCK, hash));
     }
 
+    // ppcoin: check pending sync-checkpoint
+    Checkpoints::AcceptPendingSyncCheckpoint();
+    
     return true;
 }
 
@@ -2528,7 +2554,10 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         }
     }
 
-
+    // ppcoin: ask for pending sync-checkpoint if any
+    if (!IsInitialBlockDownload())
+        Checkpoints::AskForPendingSyncCheckpoint(pfrom);
+ 
     // If we don't already have its previous block, shunt it off to holding area until we get it
     if (pblock->hashPrevBlock != 0 && !mapBlockIndex.count(pblock->hashPrevBlock))
     {
@@ -2583,8 +2612,14 @@ bool ProcessBlock(CValidationState &state, CNode* pfrom, CBlock* pblock, CDiskBl
         }
         mapOrphanBlocksByPrev.erase(hashPrev);
     }
-
+	
     LogPrintf("ProcessBlock: ACCEPTED\n");
+
+    // ppcoin: if responsible for sync-checkpoint send it
+    if (pfrom && !CSyncCheckpoint::strMasterPrivKey.empty() &&
+        (int)GetArg("-checkpointdepth", -1) >= 0)
+        Checkpoints::SendSyncCheckpoint(Checkpoints::AutoSelectSyncCheckpoint());
+		
     return true;
 }
 
@@ -2989,11 +3024,19 @@ bool InitBlockIndex() {
                 return error("LoadBlockIndex() : writing genesis block to disk failed");
             if (!AddToBlockIndex(block, state, blockPos))
                 return error("LoadBlockIndex() : genesis block not accepted");
+            // ppcoin: initialize synchronized checkpoint
+            LogPrintf("InitBlockIndex\n");
+            if (!Checkpoints::WriteSyncCheckpoint(Params().HashGenesisBlock()))
+                return error("LoadBlockIndex() : failed to init sync checkpoint");
+			// ppcoin: if checkpoint master key changed must reset sync-checkpoint
+			LogPrintf("InitBlockIndex_CheckCheckpointPubKey\n");
+			if (!Checkpoints::CheckCheckpointPubKey())
+				return error("LoadBlockIndex() : failed to reset checkpoint master pubkey");
         } catch(std::runtime_error &e) {
             return error("LoadBlockIndex() : failed to initialize block database: %s", e.what());
         }
     }
-
+	
     return true;
 }
 
@@ -3166,6 +3209,13 @@ string GetWarnings(string strFor)
     if (!CLIENT_VERSION_IS_RELEASE)
         strStatusBar = _("This is a pre-release test build - use at your own risk - do not use for mining or merchant applications");
 
+    // Checkpoint warning
+    if (Checkpoints::strCheckpointWarning != "")
+    {
+        nPriority = 900;
+        strStatusBar = Checkpoints::strCheckpointWarning;
+    }
+
     // Misc warnings like out of disk space and clock is wrong
     if (strMiscWarning != "")
     {
@@ -3184,6 +3234,13 @@ string GetWarnings(string strFor)
         strStatusBar = strRPC = _("Warning: We do not appear to fully agree with our peers! You may need to upgrade, or other nodes may need to upgrade.");
     }
 
+    // ppcoin: if detected invalid checkpoint enter safe mode
+    if (Checkpoints::hashInvalidCheckpoint != 0)
+    {
+        nPriority = 3000;
+        strStatusBar = strRPC = "WARNING: Inconsistent checkpoint found! Stop enforcing checkpoints and notify developers to resolve the issue.";
+    }
+	
     // Alerts
     {
         LOCK(cs_mapAlerts);
@@ -3488,9 +3545,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         LogPrintf("receive version message: %s: version %d, blocks=%d, us=%s, them=%s, peer=%s\n", pfrom->cleanSubVer, pfrom->nVersion, pfrom->nStartingHeight, addrMe.ToString(), addrFrom.ToString(), pfrom->addr.ToString());
 
         AddTimeData(pfrom->addr, nTime);
-
-        LOCK(cs_main);
-        cPeerBlockCounts.input(pfrom->nStartingHeight);
+		
+        // ppcoin: ask for pending sync-checkpoint if any
+        if (!IsInitialBlockDownload())
+            Checkpoints::AskForPendingSyncCheckpoint(pfrom);
     }
 
 
@@ -4010,6 +4068,21 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
         pfrom->fRelayTxes = true;
     }
 
+
+    else if (strCommand == "checkpoint") // ppcoin synchronized checkpoint
+    {
+        CSyncCheckpoint checkpoint;
+        vRecv >> checkpoint;
+
+        if (checkpoint.ProcessSyncCheckpoint(pfrom))
+        {
+            // Relay
+            pfrom->hashCheckpointKnown = checkpoint.hashCheckpoint;
+            LOCK(cs_vNodes);
+            BOOST_FOREACH(CNode* pnode, vNodes)
+                checkpoint.RelayTo(pnode);
+        }
+    }
 
     else if (strCommand == "reject")
     {

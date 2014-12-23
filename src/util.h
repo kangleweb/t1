@@ -35,8 +35,8 @@
 class CNetAddr;
 class uint256;
 
-static const int64_t COIN = 100000000;
-static const int64_t CENT = 1000000;
+static const int64_t COIN = 100000;
+static const int64_t CENT = COIN / 100;
 
 #define BEGIN(a)            ((char*)&(a))
 #define END(a)              ((char*)&((&(a))[1]))
@@ -364,6 +364,15 @@ int64_t GetArg(const std::string& strArg, int64_t nDefault);
  * @return command-line argument or default value
  */
 bool GetBoolArg(const std::string& strArg, bool fDefault);
+
+/**
+ * Set an argument 
+ *
+ * @param strArg Argument to set (e.g. "-foo")
+ * @param strValue Value (e.g. "1")
+ */
+void SetArg(const std::string& strArg, const std::string& strValue);
+void SetBoolArg(const std::string& strArg, const bool boolValue);
 
 /**
  * Set an argument if it doesn't already have a value
